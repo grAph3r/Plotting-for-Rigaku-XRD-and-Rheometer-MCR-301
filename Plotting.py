@@ -153,14 +153,20 @@ if app_mode == "Rheology (Anton Paar)":
                 min_x = float(plot_df["Shear Rate"].min())
                 max_x = float(plot_df["Shear Rate"].max())
                 
-                # Dynamically set the formatting of the input box based on the X-axis scale toggle
-                dynamic_input_format = "%.3e" if x_scale == "Logarithmic" else "%.3f"
-                
                 col1, col2 = st.sidebar.columns(2)
                 with col1:
-                    user_min_x = st.number_input("Min Shear Rate", value=min_x, format=dynamic_input_format)
+                    user_min_x = st.number_input("Min Shear Rate", value=min_x, format="%.3e")
                 with col2:
-                    user_max_x = st.number_input("Max Shear Rate", value=max_x, format=dynamic_input_format)
+                    user_max_x = st.number_input("Max Shear Rate", value=max_x, format="%.3e")
+
+                # FEATURE: Graph Dimensions
+                st.sidebar.header("7. Graph Dimensions (Aspect Ratio)")
+                use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, help="Uncheck to auto-fill the screen. Check to make the graph square or specifically sized for export.")
+                if use_custom_size:
+                    graph_width = st.sidebar.slider("Graph Width (pixels)", min_value=400, max_value=1600, value=800, step=50)
+                    graph_height = st.sidebar.slider("Graph Height (pixels)", min_value=400, max_value=1600, value=800, step=50)
+                else:
+                    graph_height = 800
 
                 filtered_df = plot_df[(plot_df["Shear Rate"] >= user_min_x) & (plot_df["Shear Rate"] <= user_max_x)]
                 st.caption("Hover over the top right of the graph and click the 'Camera' icon to download a high-resolution PNG for presentations.")
@@ -204,8 +210,18 @@ if app_mode == "Rheology (Anton Paar)":
                         fig.update_yaxes(title_text=get_axis_label(y_col), type=y_type, exponentformat=y_exp_format, dtick=y_dtick, ticks="inside", showline=True, linecolor='black', mirror=True)
                         fig.update_layout(plot_bgcolor='white')
 
-                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': 'Rheology_Plot', 'height': 900, 'width': 1200, 'scale': 3}}
-                    st.plotly_chart(fig, use_container_width=True, height=800, config=export_config)
+                    # Apply custom dimensions to the chart object itself
+                    if use_custom_size:
+                        fig.update_layout(width=graph_width, height=graph_height)
+                    else:
+                        fig.update_layout(height=graph_height)
+
+                    # Ensure the exported high-res PNG reflects the requested dimensions
+                    exp_w = graph_width if use_custom_size else 1200
+                    exp_h = graph_height if use_custom_size else 900
+                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': 'Rheology_Plot', 'height': exp_h, 'width': exp_w, 'scale': 3}}
+                    
+                    st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
                 else:
                     st.warning("No data points exist within the selected ranges.")
             else:
@@ -267,6 +283,15 @@ elif app_mode == "X-Ray Diffraction (XRD)":
             st.sidebar.header("5. Plot Mode")
             display_mode = st.sidebar.radio("Display Mode", ["Overlay", "Stacked"])
 
+            # FEATURE: Graph Dimensions
+            st.sidebar.header("6. Graph Dimensions (Aspect Ratio)")
+            use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, help="Uncheck to auto-fill the screen. Check to make the graph square or specifically sized for export.", key="xrd_size_toggle")
+            if use_custom_size:
+                graph_width = st.sidebar.slider("Graph Width (pixels)", min_value=400, max_value=1600, value=800, step=50, key="xrd_w")
+                graph_height = st.sidebar.slider("Graph Height (pixels)", min_value=400, max_value=1600, value=800, step=50, key="xrd_h")
+            else:
+                graph_height = 700
+
             if selected_xrd_files:
                 first_file_df = all_xrd_data[selected_xrd_files[0]]
                 col_options = list(first_file_df.columns)
@@ -311,8 +336,16 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                     else:
                         fig.update_yaxes(title_text="Normalized Intensity (a.u.)", showticklabels=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
 
-                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': f'XRD_Plot_{display_mode}', 'height': 900, 'width': 1200, 'scale': 3}}
-                    st.plotly_chart(fig, use_container_width=True, height=700, config=export_config)
+                    if use_custom_size:
+                        fig.update_layout(width=graph_width, height=graph_height)
+                    else:
+                        fig.update_layout(height=graph_height)
+
+                    exp_w = graph_width if use_custom_size else 1200
+                    exp_h = graph_height if use_custom_size else 900
+                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': f'XRD_Plot_{display_mode}', 'height': exp_h, 'width': exp_w, 'scale': 3}}
+                    
+                    st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
                     
                     # ---------------------------------------------------------
                     # 🔬 INDEPENDENT PER-SAMPLE LOTGERING FACTOR
@@ -324,6 +357,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                         with col1:
                             search_window = st.slider("Peak Search Window (± 2-Theta)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
                         
+                        # Master Reference Table populated from the uploaded PDFs
                         if 'ref_peaks_df' not in st.session_state:
                             st.session_state.ref_peaks_df = pd.DataFrame({
                                 "Phase": ["Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "ZrO2", "ZrO2", "ZrO2", "ZrO2"],
@@ -334,6 +368,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             })
                             
                         ref_peaks = st.data_editor(st.session_state.ref_peaks_df, num_rows="dynamic", use_container_width=True)
+                        
                         ref_peaks["Phase_Plane"] = ref_peaks["Phase"] + " " + ref_peaks["Plane (hkl)"]
                         all_planes = ref_peaks["Phase_Plane"].tolist()
                         
@@ -366,7 +401,6 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                                     df = all_xrd_data[file_name]
                                     sum_i_all = 0
                                     sum_i_pref = 0
-                                    
                                     extracted_intensities = {}
                                     
                                     for _, row in sample_ref_peaks.iterrows():
