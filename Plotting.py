@@ -25,34 +25,45 @@ def parse_rheometer_txt(file_content):
     intervals, data_lines = {}, []
     current_interval = 0
     is_data_section = False
+    headers = []
     
     for line in lines:
         line = line.strip()
-        if line.startswith("Meas. Pts."):
-            if data_lines:  
-                df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-                intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
+        # Detect the start of a new data block and read headers dynamically
+        if line.startswith("Meas. Pts"):
+            if data_lines and headers:  
+                df = pd.DataFrame(data_lines, columns=headers)
+                # Strip out entirely non-numeric columns (like 'Status') and drop broken rows
+                df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(how='any')
+                if not df.empty:
+                    intervals[f"Interval {current_interval}"] = df
                 data_lines = []
             current_interval += 1
             is_data_section = True
+            headers = [h.strip() for h in line.split('\t') if h.strip()]
             continue
         if is_data_section and line.startswith("["):
             continue
         if is_data_section and line == "":
             is_data_section = False
-            if data_lines:
-                df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-                intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
+            if data_lines and headers:
+                df = pd.DataFrame(data_lines, columns=headers)
+                df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(how='any')
+                if not df.empty:
+                    intervals[f"Interval {current_interval}"] = df
                 data_lines = []
             continue
         if is_data_section:
             values = [v.replace(',', '') for v in line.split('\t')]
-            if len(values) >= 7:
-                data_lines.append(values[:7])
+            if len(values) >= len(headers) and len(headers) > 0:
+                data_lines.append(values[:len(headers)])
 
-    if data_lines:
-        df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-        intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
+    # Catch the final interval
+    if data_lines and headers:
+        df = pd.DataFrame(data_lines, columns=headers)
+        df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(how='any')
+        if not df.empty:
+            intervals[f"Interval {current_interval}"] = df
         
     return intervals
 
@@ -131,7 +142,14 @@ if app_mode == "Rheology (Anton Paar)":
         plot_df = pd.DataFrame()
         for unique_inv in sorted_intervals:
             temp_df = all_parsed_intervals[unique_inv].copy()
-            base_viscosity = temp_df["Shear Stress"] / temp_df["Shear Rate"]
+            
+            # Robustly compute base viscosity
+            if "Shear Stress" in temp_df.columns and "Shear Rate" in temp_df.columns:
+                base_viscosity = temp_df["Shear Stress"] / temp_df["Shear Rate"]
+            elif "Viscosity" in temp_df.columns:
+                base_viscosity = temp_df["Viscosity"]
+            else:
+                base_viscosity = pd.Series(np.nan, index=temp_df.index)
             
             if visc_unit == "Pa·s": temp_df["Converted Viscosity"] = base_viscosity
             elif visc_unit == "mPa·s (cP)": temp_df["Converted Viscosity"] = base_viscosity * 1000
@@ -155,38 +173,44 @@ if app_mode == "Rheology (Anton Paar)":
             x_exp_format, x_dtick = ("power", 1) if x_type == "log" else ("none", None)
             y_exp_format, y_dtick = ("power", 1) if y_type == "log" else ("none", None)
 
-            st.sidebar.header("6. Filter Data Range")
+            # Safely determine the primary X-axis column for filtering
+            x_axis_col = "Shear Rate" if "Shear Rate" in plot_df.columns else plot_df.columns[0]
+            st.sidebar.header(f"6. Filter Data Range ({x_axis_col})")
+            
             col1, col2 = st.sidebar.columns(2)
-            user_min_x = col1.number_input("Min Shear Rate", value=float(plot_df["Shear Rate"].min()), format="%.3e")
-            user_max_x = col2.number_input("Max Shear Rate", value=float(plot_df["Shear Rate"].max()), format="%.3e")
+            user_min_x = col1.number_input(f"Min", value=float(plot_df[x_axis_col].min()), format="%.3e")
+            user_max_x = col2.number_input(f"Max", value=float(plot_df[x_axis_col].max()), format="%.3e")
 
             st.sidebar.header("7. Graph Dimensions")
             use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False)
             graph_width = st.sidebar.slider("Width (px)", 400, 1600, 800, 50) if use_custom_size else 1200
             graph_height = st.sidebar.slider("Height (px)", 400, 1600, 800, 50) if use_custom_size else 800
 
-            filtered_df = plot_df[(plot_df["Shear Rate"] >= user_min_x) & (plot_df["Shear Rate"] <= user_max_x)]
+            filtered_df = plot_df[(plot_df[x_axis_col] >= user_min_x) & (plot_df[x_axis_col] <= user_max_x)]
             
             if not filtered_df.empty:
-                st.caption("💡 **Tip:** Hover over the top right to download a high-res PNG.")
+                st.caption("💡 **Tip:** You can click and drag the Legend box directly on the graph! Hover over the top right to download a high-res PNG.")
                 
                 if plot_mode == "Anton Paar Dual-Axis (Visc & Stress)":
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    for inv in sorted_intervals:
-                        data = filtered_df[filtered_df["Interval"] == inv]
-                        name, color = custom_labels[inv], custom_colors[inv]
+                    if "Shear Rate" not in filtered_df.columns or "Shear Stress" not in filtered_df.columns:
+                        st.error("Missing required columns ('Shear Rate' and 'Shear Stress') for the Dual-Axis layout. Please use 'Single Variable' mode.")
+                    else:
+                        fig = make_subplots(specs=[[{"secondary_y": True}]])
+                        for inv in sorted_intervals:
+                            data = filtered_df[filtered_df["Interval"] == inv]
+                            name, color = custom_labels[inv], custom_colors[inv]
+                            
+                            fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Converted Viscosity"], name=f"{name} (Viscosity)", mode='lines+markers', marker_symbol='diamond', line=dict(color=color)), secondary_y=False)
+                            fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Shear Stress"], name=f"{name} (Stress)", mode='lines+markers', marker_symbol='square', line=dict(color=color, dash='dot')), secondary_y=True)
                         
-                        fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Converted Viscosity"], name=f"{name} (Viscosity)", mode='lines+markers', marker_symbol='diamond', line=dict(color=color)), secondary_y=False)
-                        fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Shear Stress"], name=f"{name} (Stress)", mode='lines+markers', marker_symbol='square', line=dict(color=color, dash='dot')), secondary_y=True)
-                    
-                    fig.update_layout(plot_bgcolor='white', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                    fig.update_xaxes(title_text="Shear Rate [1/s]", type=x_type, exponentformat=x_exp_format, dtick=x_dtick, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
-                    fig.update_yaxes(title_text=f"Viscosity [{visc_unit}]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=False, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black')
-                    fig.update_yaxes(title_text="Shear Stress [Pa]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black')
+                        fig.update_layout(plot_bgcolor='white', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                        fig.update_xaxes(title_text="Shear Rate [1/s]", type=x_type, exponentformat=x_exp_format, dtick=x_dtick, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
+                        fig.update_yaxes(title_text=f"Viscosity [{visc_unit}]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=False, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black')
+                        fig.update_yaxes(title_text="Shear Stress [Pa]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black')
                 else:
-                    available_cols = ["Shear Rate", "Shear Stress", "Converted Viscosity", "Strain", "Interval Time", "Torque"]
-                    x_col = st.sidebar.selectbox("X-axis", available_cols, index=0) 
-                    y_col = st.sidebar.selectbox("Y-axis", available_cols, index=2) 
+                    available_cols = [c for c in plot_df.columns if c not in ["Interval", "Meas. Pts.", "Meas. Pts"]]
+                    x_col = st.sidebar.selectbox("X-axis", available_cols, index=available_cols.index("Shear Rate") if "Shear Rate" in available_cols else 0) 
+                    y_col = st.sidebar.selectbox("Y-axis", available_cols, index=available_cols.index("Converted Viscosity") if "Converted Viscosity" in available_cols else (1 if len(available_cols) > 1 else 0)) 
                     
                     display_df = filtered_df.copy()
                     display_df["Interval"] = display_df["Interval"].map(custom_labels)
@@ -328,6 +352,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                     
                     min_y, max_y = temp_df[y_col].min(), temp_df[y_col].max()
                     temp_df["Normalized Intensity"] = (temp_df[y_col] - min_y) / (max_y - min_y) if max_y > min_y else 0
+                    
                     temp_df["Plot Intensity"] = temp_df["Normalized Intensity"] + i if display_mode == "Stacked" else temp_df["Normalized Intensity"]
                     plot_data = pd.concat([plot_data, temp_df])
 
@@ -340,21 +365,17 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                 fig = px.line(plot_data, x=x_col, y="Plot Intensity", color="Sample Name", color_discrete_map=color_map)
                 fig.update_traces(opacity=line_opacity)
                 
-                # --- NEW: HIDE STANDARD LEGEND, ADD FLOATING LABELS ---
                 fig.update_layout(showlegend=False)
                 
                 for file_name in sorted_xrd_files:
                     s_name = custom_xrd_labels[file_name]
                     c_color = custom_xrd_colors[file_name]
                     
-                    # Isolate data for this specific line
                     s_data = plot_data[plot_data["Sample Name"] == s_name]
                     if not s_data.empty:
-                        # Find the max 2-Theta point (the end of the line)
                         max_x = s_data[x_col].max()
                         end_y = s_data[s_data[x_col] == max_x]["Plot Intensity"].values[0]
                         
-                        # Pin label directly to the end of the line
                         fig.add_annotation(
                             x=max_x,
                             y=end_y,
@@ -363,12 +384,9 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             showarrow=False,
                             xanchor="left",
                             yanchor="middle",
-                            xshift=10 # Nudges it slightly right so it doesn't overlap the line
+                            xshift=10
                         )
                 
-                # ---------------------------------------------------------
-                # ANNOTATIONS: Miller Indices
-                # ---------------------------------------------------------
                 if show_annotations and not ref_peaks.empty:
                     is_shown = ref_peaks["Show on Graph?"].fillna(False).astype(bool)
                     for _, row in ref_peaks[is_shown].iterrows():
@@ -384,7 +402,6 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             ax=0, ay=-30, textangle=-90, xanchor="center", yanchor="bottom"
                         )
                 
-                # Extended right margin so floating labels fit during image export
                 fig.update_layout(plot_bgcolor='white', hovermode="x unified", margin=dict(r=150))
                 fig.update_xaxes(title_text="2θ (degrees)", type="linear", showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
                 
