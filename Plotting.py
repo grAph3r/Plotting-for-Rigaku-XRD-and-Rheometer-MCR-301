@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 
-st.set_page_config(page_title="Material Analysis Plotter", layout="wide")
+st.set_page_config(page_title="Material Characterization Plotter", layout="wide")
 
 st.title("Material Characterization Plotter")
 
@@ -14,22 +15,15 @@ DEFAULT_COLORS = [
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
 ]
 
-# ---------------------------------------------------------
-# 1. PARSER FUNCTIONS
-# ---------------------------------------------------------
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+@st.cache_data
 def parse_rheometer_txt(file_content):
-    try:
-        decoded_content = file_content.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            decoded_content = file_content.decode("cp932") 
-        except UnicodeDecodeError:
-            decoded_content = file_content.decode("shift_jis", errors="ignore")
-
+    decoded_content = decode_file(file_content)
     lines = decoded_content.splitlines()
-    intervals = {}
+    intervals, data_lines = {}, []
     current_interval = 0
-    data_lines = []
     is_data_section = False
     
     for line in lines:
@@ -37,8 +31,7 @@ def parse_rheometer_txt(file_content):
         if line.startswith("Meas. Pts."):
             if data_lines:  
                 df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-                df = df.apply(pd.to_numeric, errors='coerce').dropna()
-                intervals[f"Interval {current_interval}"] = df
+                intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
                 data_lines = []
             current_interval += 1
             is_data_section = True
@@ -49,20 +42,18 @@ def parse_rheometer_txt(file_content):
             is_data_section = False
             if data_lines:
                 df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-                df = df.apply(pd.to_numeric, errors='coerce').dropna()
-                intervals[f"Interval {current_interval}"] = df
+                intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
                 data_lines = []
             continue
         if is_data_section:
-            values = line.split('\t')
+            values = [v.replace(',', '') for v in line.split('\t')]
             if len(values) >= 7:
-                values = [v.replace(',', '') for v in values]
                 data_lines.append(values[:7])
 
     if data_lines:
         df = pd.DataFrame(data_lines, columns=["Meas. Pts", "Raw Viscosity", "Shear Rate", "Shear Stress", "Strain", "Interval Time", "Torque"])
-        df = df.apply(pd.to_numeric, errors='coerce').dropna()
-        intervals[f"Interval {current_interval}"] = df
+        intervals[f"Interval {current_interval}"] = df.apply(pd.to_numeric, errors='coerce').dropna()
+        
     return intervals
 
 def decode_file(file_content):
@@ -74,10 +65,34 @@ def decode_file(file_content):
         except UnicodeDecodeError:
             return file_content.decode("shift_jis", errors="ignore")
 
+def strip_ka2_rachinger(two_theta, intensity, lambda1=1.540598, lambda2=1.544426, ratio=0.5):
+    theta = np.radians(two_theta / 2.0)
+    sin_theta_source = (lambda1 / lambda2) * np.sin(theta)
+    theta_source = np.arcsin(np.clip(sin_theta_source, -1.0, 1.0))
+    two_theta_source = np.degrees(2.0 * theta_source)
+    
+    sort_idx = np.argsort(two_theta)
+    two_theta_sorted = two_theta[sort_idx]
+    intensity_sorted = intensity[sort_idx]
+    
+    I_stripped_sorted = np.zeros_like(intensity_sorted)
+    
+    for i, t2 in enumerate(two_theta_sorted):
+        t2_src = two_theta_source[sort_idx][i]
+        if t2_src < two_theta_sorted[0]:
+            I_stripped_sorted[i] = intensity_sorted[i]
+        else:
+            I_src = np.interp(t2_src, two_theta_sorted[:i], I_stripped_sorted[:i])
+            I_stripped_sorted[i] = intensity_sorted[i] - (ratio * I_src)
+            
+    I_stripped_sorted = np.clip(I_stripped_sorted, 0, None)
+    unsort_idx = np.argsort(sort_idx)
+    return I_stripped_sorted[unsort_idx]
 
-# ---------------------------------------------------------
+
+# =========================================================
 # MAIN NAVIGATION
-# ---------------------------------------------------------
+# =========================================================
 st.sidebar.title("Navigation")
 app_mode = st.sidebar.radio("Select Analysis Module:", ["Rheology (Anton Paar)", "X-Ray Diffraction (XRD)"])
 st.sidebar.divider()
@@ -87,310 +102,320 @@ st.sidebar.divider()
 # =========================================================
 if app_mode == "Rheology (Anton Paar)":
     st.header("Rheometer Analysis")
-    
     st.sidebar.header("1. Upload Data")
     uploaded_files = st.sidebar.file_uploader("Upload Anton Paar .txt files", type=["txt"], accept_multiple_files=True)
 
     if uploaded_files:
-        try:
-            all_parsed_intervals = {}
-            for file in uploaded_files:
-                file_name = file.name
-                parsed_intervals = parse_rheometer_txt(file.getvalue())
-                for inv_name, df in parsed_intervals.items():
-                    unique_name = f"{file_name} | {inv_name}"
-                    all_parsed_intervals[unique_name] = df
-            
-            st.sidebar.header("2. Data Selection")
-            selected_intervals = st.sidebar.multiselect(
-                "Select Measurement Intervals", 
-                list(all_parsed_intervals.keys()), 
-                default=list(all_parsed_intervals.keys())
-            )
-            
-            st.sidebar.header("3. Customize Legends & Colors")
-            custom_labels = {}
-            custom_colors = {}
-            for i, unique_inv in enumerate(selected_intervals):
-                col1, col2 = st.sidebar.columns([3, 1])
-                with col1:
-                    custom_labels[unique_inv] = st.text_input(f"Rename:", value=unique_inv, key=f"name_{unique_inv}")
-                with col2:
-                    default_color = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
-                    custom_colors[unique_inv] = st.color_picker("Color", value=default_color, key=f"color_{unique_inv}")
-            
-            st.sidebar.header("4. Viscosity Units")
-            visc_unit = st.sidebar.selectbox("Convert Viscosity to:", ["Pa·s", "mPa·s (cP)", "Poise (P)"])
+        all_parsed_intervals = {}
+        for file in uploaded_files:
+            parsed_intervals = parse_rheometer_txt(file.getvalue())
+            for inv_name, df in parsed_intervals.items():
+                all_parsed_intervals[f"{file.name} | {inv_name}"] = df
+        
+        st.sidebar.header("2. Data Selection")
+        selected_intervals = st.sidebar.multiselect("Select Measurement Intervals", list(all_parsed_intervals.keys()), default=list(all_parsed_intervals.keys()))
+        
+        st.sidebar.header("3. Customize Legends, Colors & Order")
+        custom_labels, custom_colors, custom_orders = {}, {}, {}
+        for i, unique_inv in enumerate(selected_intervals):
+            col1, col2, col3 = st.sidebar.columns([1, 2, 1])
+            custom_orders[unique_inv] = col1.number_input("Order", value=i, step=1, key=f"order_{unique_inv}")
+            custom_labels[unique_inv] = col2.text_input("Rename:", value=unique_inv, key=f"name_{unique_inv}")
+            custom_colors[unique_inv] = col3.color_picker("Color", value=DEFAULT_COLORS[i % len(DEFAULT_COLORS)], key=f"color_{unique_inv}")
+        
+        sorted_intervals = sorted(selected_intervals, key=lambda x: custom_orders[x])
+        
+        st.sidebar.header("4. Viscosity Units")
+        visc_unit = st.sidebar.selectbox("Convert Viscosity to:", ["Pa·s", "mPa·s (cP)", "Poise (P)"])
 
-            plot_df = pd.DataFrame()
-            for unique_inv in selected_intervals:
-                temp_df = all_parsed_intervals[unique_inv].copy()
-                base_viscosity = temp_df["Shear Stress"] / temp_df["Shear Rate"]
-                if visc_unit == "Pa·s":
-                    temp_df["Converted Viscosity"] = base_viscosity
-                elif visc_unit == "mPa·s (cP)":
-                    temp_df["Converted Viscosity"] = base_viscosity * 1000
-                elif visc_unit == "Poise (P)":
-                    temp_df["Converted Viscosity"] = base_viscosity * 10
-                temp_df["Interval"] = unique_inv
-                plot_df = pd.concat([plot_df, temp_df])
+        plot_df = pd.DataFrame()
+        for unique_inv in sorted_intervals:
+            temp_df = all_parsed_intervals[unique_inv].copy()
+            base_viscosity = temp_df["Shear Stress"] / temp_df["Shear Rate"]
+            
+            if visc_unit == "Pa·s": temp_df["Converted Viscosity"] = base_viscosity
+            elif visc_unit == "mPa·s (cP)": temp_df["Converted Viscosity"] = base_viscosity * 1000
+            elif visc_unit == "Poise (P)": temp_df["Converted Viscosity"] = base_viscosity * 10
+                
+            temp_df["Interval"] = unique_inv
+            plot_df = pd.concat([plot_df, temp_df])
 
-            if not plot_df.empty:
-                st.sidebar.header("5. Plot Controls")
-                plot_mode = st.sidebar.radio("Plot Layout", ["Anton Paar Dual-Axis (Visc & Stress)", "Single Variable"])
-                
-                x_scale = st.sidebar.radio("X-axis Scale", ["Logarithmic", "Linear"], horizontal=True)
-                y_scale = st.sidebar.radio("Y-axis Scale", ["Logarithmic", "Linear"], horizontal=True)
-                
+        if not plot_df.empty:
+            st.sidebar.header("5. Plot Controls")
+            plot_mode = st.sidebar.radio("Plot Layout", ["Anton Paar Dual-Axis (Visc & Stress)", "Single Variable"])
+            
+            x_scale = st.sidebar.radio("X-axis Scale", ["Logarithmic", "Linear"], horizontal=True)
+            y_scale = st.sidebar.radio("Y-axis Scale", ["Logarithmic", "Linear"], horizontal=True)
+            
+            x_type, y_type = ("log", "log") if x_scale == "Logarithmic" and y_scale == "Logarithmic" else ("linear", "linear")
+            if x_scale != y_scale:
                 x_type = "log" if x_scale == "Logarithmic" else "linear"
                 y_type = "log" if y_scale == "Logarithmic" else "linear"
-                x_exp_format = "power" if x_type == "log" else "none"
-                x_dtick = 1 if x_type == "log" else None
-                y_exp_format = "power" if y_type == "log" else "none"
-                y_dtick = 1 if y_type == "log" else None
 
-                st.sidebar.header("6. Filter Data Range (Shear Rate)")
-                min_x = float(plot_df["Shear Rate"].min())
-                max_x = float(plot_df["Shear Rate"].max())
+            x_exp_format, x_dtick = ("power", 1) if x_type == "log" else ("none", None)
+            y_exp_format, y_dtick = ("power", 1) if y_type == "log" else ("none", None)
+
+            st.sidebar.header("6. Filter Data Range")
+            col1, col2 = st.sidebar.columns(2)
+            user_min_x = col1.number_input("Min Shear Rate", value=float(plot_df["Shear Rate"].min()), format="%.3e")
+            user_max_x = col2.number_input("Max Shear Rate", value=float(plot_df["Shear Rate"].max()), format="%.3e")
+
+            st.sidebar.header("7. Graph Dimensions")
+            use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False)
+            graph_width = st.sidebar.slider("Width (px)", 400, 1600, 800, 50) if use_custom_size else 1200
+            graph_height = st.sidebar.slider("Height (px)", 400, 1600, 800, 50) if use_custom_size else 800
+
+            filtered_df = plot_df[(plot_df["Shear Rate"] >= user_min_x) & (plot_df["Shear Rate"] <= user_max_x)]
+            
+            if not filtered_df.empty:
+                st.caption("💡 **Tip:** Hover over the top right to download a high-res PNG.")
                 
-                col1, col2 = st.sidebar.columns(2)
-                with col1:
-                    user_min_x = st.number_input("Min Shear Rate", value=min_x, format="%.3e")
-                with col2:
-                    user_max_x = st.number_input("Max Shear Rate", value=max_x, format="%.3e")
-
-                # FEATURE: Graph Dimensions
-                st.sidebar.header("7. Graph Dimensions (Aspect Ratio)")
-                use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, help="Uncheck to auto-fill the screen. Check to make the graph square or specifically sized for export.")
-                if use_custom_size:
-                    graph_width = st.sidebar.slider("Graph Width (pixels)", min_value=400, max_value=1600, value=800, step=50)
-                    graph_height = st.sidebar.slider("Graph Height (pixels)", min_value=400, max_value=1600, value=800, step=50)
-                else:
-                    graph_height = 800
-
-                filtered_df = plot_df[(plot_df["Shear Rate"] >= user_min_x) & (plot_df["Shear Rate"] <= user_max_x)]
-                st.caption("Hover over the top right of the graph and click the 'Camera' icon to download a high-resolution PNG for presentations.")
-                
-                if not filtered_df.empty:
-                    if plot_mode == "Anton Paar Dual-Axis (Visc & Stress)":
-                        fig = make_subplots(specs=[[{"secondary_y": True}]])
-                        for unique_inv in selected_intervals:
-                            interval_data = filtered_df[filtered_df["Interval"] == unique_inv]
-                            display_name = custom_labels[unique_inv]
-                            user_color = custom_colors[unique_inv]
-                            
-                            fig.add_trace(go.Scatter(x=interval_data["Shear Rate"], y=interval_data["Converted Viscosity"], name=f"{display_name} (Viscosity)", mode='lines+markers', marker_symbol='diamond', line=dict(color=user_color)), secondary_y=False)
-                            fig.add_trace(go.Scatter(x=interval_data["Shear Rate"], y=interval_data["Shear Stress"], name=f"{display_name} (Stress)", mode='lines+markers', marker_symbol='square', line=dict(color=user_color, dash='dot')), secondary_y=True)
+                if plot_mode == "Anton Paar Dual-Axis (Visc & Stress)":
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    for inv in sorted_intervals:
+                        data = filtered_df[filtered_df["Interval"] == inv]
+                        name, color = custom_labels[inv], custom_colors[inv]
                         
-                        fig.update_layout(plot_bgcolor='white', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                        fig.update_xaxes(title_text="Shear Rate [1/s]", type=x_type, exponentformat=x_exp_format, dtick=x_dtick, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
-                        fig.update_yaxes(title_text=f"Viscosity [{visc_unit}]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=False, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black')
-                        fig.update_yaxes(title_text="Shear Stress [Pa]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black')
-                    else:
-                        available_cols = ["Shear Rate", "Shear Stress", "Converted Viscosity", "Strain", "Interval Time", "Torque"]
-                        x_col = st.sidebar.selectbox("X-axis", available_cols, index=0) 
-                        y_col = st.sidebar.selectbox("Y-axis", available_cols, index=2) 
-                        
-                        display_df = filtered_df.copy()
-                        display_df["Interval"] = display_df["Interval"].map(custom_labels)
-                        color_map = {custom_labels[inv]: custom_colors[inv] for inv in selected_intervals}
-                        
-                        fig = px.line(display_df, x=x_col, y=y_col, color="Interval", color_discrete_map=color_map, markers=True, symbol="Interval")
-                        
-                        def get_axis_label(col):
-                            if col == "Converted Viscosity": return f"Viscosity [{visc_unit}]"
-                            if col == "Shear Rate": return "Shear Rate [1/s]"
-                            if col == "Shear Stress": return "Shear Stress [Pa]"
-                            if col == "Strain": return "Strain [%]"
-                            if col == "Interval Time": return "Time [s]"
-                            if col == "Torque": return "Torque [mNm]"
-                            return col
-                        
-                        fig.update_xaxes(title_text=get_axis_label(x_col), type=x_type, exponentformat=x_exp_format, dtick=x_dtick, ticks="inside", showline=True, linecolor='black', mirror=True)
-                        fig.update_yaxes(title_text=get_axis_label(y_col), type=y_type, exponentformat=y_exp_format, dtick=y_dtick, ticks="inside", showline=True, linecolor='black', mirror=True)
-                        fig.update_layout(plot_bgcolor='white')
-
-                    # Apply custom dimensions to the chart object itself
-                    if use_custom_size:
-                        fig.update_layout(width=graph_width, height=graph_height)
-                    else:
-                        fig.update_layout(height=graph_height)
-
-                    # Ensure the exported high-res PNG reflects the requested dimensions
-                    exp_w = graph_width if use_custom_size else 1200
-                    exp_h = graph_height if use_custom_size else 900
-                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': 'Rheology_Plot', 'height': exp_h, 'width': exp_w, 'scale': 3}}
+                        fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Converted Viscosity"], name=f"{name} (Viscosity)", mode='lines+markers', marker_symbol='diamond', line=dict(color=color)), secondary_y=False)
+                        fig.add_trace(go.Scatter(x=data["Shear Rate"], y=data["Shear Stress"], name=f"{name} (Stress)", mode='lines+markers', marker_symbol='square', line=dict(color=color, dash='dot')), secondary_y=True)
                     
-                    st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
+                    fig.update_layout(plot_bgcolor='white', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    fig.update_xaxes(title_text="Shear Rate [1/s]", type=x_type, exponentformat=x_exp_format, dtick=x_dtick, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
+                    fig.update_yaxes(title_text=f"Viscosity [{visc_unit}]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=False, showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black')
+                    fig.update_yaxes(title_text="Shear Stress [Pa]", type=y_type, exponentformat=y_exp_format, dtick=y_dtick, secondary_y=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black')
                 else:
-                    st.warning("No data points exist within the selected ranges.")
+                    available_cols = ["Shear Rate", "Shear Stress", "Converted Viscosity", "Strain", "Interval Time", "Torque"]
+                    x_col = st.sidebar.selectbox("X-axis", available_cols, index=0) 
+                    y_col = st.sidebar.selectbox("Y-axis", available_cols, index=2) 
+                    
+                    display_df = filtered_df.copy()
+                    display_df["Interval"] = display_df["Interval"].map(custom_labels)
+                    color_map = {custom_labels[inv]: custom_colors[inv] for inv in sorted_intervals}
+                    
+                    fig = px.line(display_df, x=x_col, y=y_col, color="Interval", color_discrete_map=color_map, markers=True, symbol="Interval")
+                    
+                    def get_axis_label(col):
+                        labels = {"Converted Viscosity": f"Viscosity [{visc_unit}]", "Shear Rate": "Shear Rate [1/s]", "Shear Stress": "Shear Stress [Pa]", "Strain": "Strain [%]", "Interval Time": "Time [s]", "Torque": "Torque [mNm]"}
+                        return labels.get(col, col)
+                    
+                    fig.update_xaxes(title_text=get_axis_label(x_col), type=x_type, exponentformat=x_exp_format, dtick=x_dtick, ticks="inside", showline=True, linecolor='black', mirror=True)
+                    fig.update_yaxes(title_text=get_axis_label(y_col), type=y_type, exponentformat=y_exp_format, dtick=y_dtick, ticks="inside", showline=True, linecolor='black', mirror=True)
+                    fig.update_layout(plot_bgcolor='white', legend=dict(title=None))
+
+                if use_custom_size: fig.update_layout(width=graph_width, height=graph_height)
+                else: fig.update_layout(height=800)
+
+                export_config = {
+                    'toImageButtonOptions': {'format': 'png', 'filename': 'Rheology_Plot', 'height': graph_height if use_custom_size else 900, 'width': graph_width if use_custom_size else 1200, 'scale': 3},
+                    'editable': True,
+                    'edits': {'legendPosition': True, 'annotationPosition': True, 'titleText': False, 'axisTitleText': False}
+                }
+                st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
             else:
-                st.warning("Please select at least one interval to plot.")
-        except Exception as e:
-            st.error(f"Error processing files. Details: {e}")
+                st.warning("No data points exist within the selected ranges.")
     else:
         st.info("Awaiting file upload. You can drag and drop multiple .txt files here.")
 
 
 # =========================================================
-# MODULE 2: XRD & LOTGERING FACTOR
+# MODULE 2: XRD, ANNOTATIONS & LOTGERING FACTOR
 # =========================================================
 elif app_mode == "X-Ray Diffraction (XRD)":
     st.header("X-Ray Diffraction (XRD) Analysis")
-    
     st.sidebar.header("1. Upload Data")
     xrd_files = st.sidebar.file_uploader("Upload XRD Data (.csv or .txt)", type=["csv", "txt"], accept_multiple_files=True)
     
     if xrd_files:
         st.sidebar.header("2. File Settings")
-        has_headers = st.sidebar.checkbox("File contains column headers (Check if YES)", value=False)
-        st.sidebar.caption("Rigaku files often do NOT have headers. If unchecked, the app will auto-assign 2-Theta and Intensity to the first two columns.")
+        has_headers = st.sidebar.checkbox("File contains column headers", value=False)
         skip_rows = st.sidebar.number_input("Rows to Skip (Header text length)", min_value=0, value=0, step=1)
         
-        try:
-            all_xrd_data = {}
-            for file in xrd_files:
-                file_name = file.name
-                decoded_str = decode_file(file.getvalue())
-                
-                df = pd.read_csv(io.StringIO(decoded_str), skiprows=skip_rows, header=0 if has_headers else None, sep=None, engine='python')
-                if not has_headers:
-                    cols = list(df.columns)
-                    if len(cols) >= 2:
-                        df.rename(columns={cols[0]: "2-Theta", cols[1]: "Intensity"}, inplace=True)
-                    else:
-                        df.rename(columns={cols[0]: "2-Theta"}, inplace=True)
-                all_xrd_data[file_name] = df
+        all_xrd_data = {}
+        for file in xrd_files:
+            decoded_str = decode_file(file.getvalue())
+            df = pd.read_csv(io.StringIO(decoded_str), skiprows=skip_rows, header=0 if has_headers else None, sep=None, engine='python')
+            if not has_headers:
+                cols = list(df.columns)
+                if len(cols) >= 2: df.rename(columns={cols[0]: "2-Theta", cols[1]: "Intensity"}, inplace=True)
+                else: df.rename(columns={cols[0]: "2-Theta"}, inplace=True)
+            all_xrd_data[file.name] = df
+        
+        st.sidebar.header("3. Data Selection")
+        selected_xrd_files = st.sidebar.multiselect("Select Files to Plot", list(all_xrd_data.keys()), default=list(all_xrd_data.keys()))
+        
+        st.sidebar.header("4. Customize Legends, Colors & Order")
+        custom_xrd_labels, custom_xrd_colors, custom_xrd_orders = {}, {}, {}
+        for i, file_name in enumerate(selected_xrd_files):
+            col1, col2, col3 = st.sidebar.columns([1, 2, 1])
+            custom_xrd_orders[file_name] = col1.number_input("Order", value=i, step=1, key=f"xrd_order_{file_name}")
+            custom_xrd_labels[file_name] = col2.text_input("Rename:", value=file_name, key=f"xrd_name_{file_name}")
+            custom_xrd_colors[file_name] = col3.color_picker("Color", value=DEFAULT_COLORS[i % len(DEFAULT_COLORS)], key=f"xrd_color_{file_name}")
             
-            st.sidebar.header("3. Data Selection")
-            selected_xrd_files = st.sidebar.multiselect(
-                "Select Files to Plot", 
-                list(all_xrd_data.keys()), 
-                default=list(all_xrd_data.keys())
-            )
+        sorted_xrd_files = sorted(selected_xrd_files, key=lambda x: custom_xrd_orders[x])
             
-            st.sidebar.header("4. Customize Legends & Colors")
-            custom_xrd_labels = {}
-            custom_xrd_colors = {}
-            for i, file_name in enumerate(selected_xrd_files):
-                col1, col2 = st.sidebar.columns([3, 1])
-                with col1:
-                    custom_xrd_labels[file_name] = st.text_input(f"Rename:", value=file_name, key=f"xrd_name_{file_name}")
-                with col2:
-                    default_color = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
-                    custom_xrd_colors[file_name] = st.color_picker("Color", value=default_color, key=f"xrd_color_{file_name}")
-                
-            st.sidebar.header("5. Plot Mode")
-            display_mode = st.sidebar.radio("Display Mode", ["Overlay", "Stacked"])
+        st.sidebar.header("5. Plot Mode & Appearance")
+        display_mode = st.sidebar.radio("Display Mode", ["Overlay", "Stacked"])
+        strip_ka2 = st.sidebar.checkbox("Strip Cu Kα₂ Peaks (Rachinger Method)", value=False)
+        line_opacity = st.sidebar.slider("Line Opacity", 0.1, 1.0, 1.0, 0.1)
+        show_annotations = st.sidebar.checkbox("Show Miller Indices Annotations", value=False)
 
-            # FEATURE: Graph Dimensions
-            st.sidebar.header("6. Graph Dimensions (Aspect Ratio)")
-            use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, help="Uncheck to auto-fill the screen. Check to make the graph square or specifically sized for export.", key="xrd_size_toggle")
-            if use_custom_size:
-                graph_width = st.sidebar.slider("Graph Width (pixels)", min_value=400, max_value=1600, value=800, step=50, key="xrd_w")
-                graph_height = st.sidebar.slider("Graph Height (pixels)", min_value=400, max_value=1600, value=800, step=50, key="xrd_h")
+        st.sidebar.header("6. Graph Dimensions")
+        use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, key="xrd_size_toggle")
+        graph_width = st.sidebar.slider("Width (px)", 400, 1600, 800, 50, key="xrd_w") if use_custom_size else 1200
+        graph_height = st.sidebar.slider("Height (px)", 400, 1600, 800, 50, key="xrd_h") if use_custom_size else 700
+
+        # ---------------------------------------------------------
+        # 📚 CENTRAL REFERENCE DATABASE
+        # ---------------------------------------------------------
+        with st.expander("📚 Reference Peaks Database (Al2O3 / ZrO2)", expanded=False):
+            if 'ref_peaks_df' not in st.session_state:
+                st.session_state.ref_peaks_df = pd.DataFrame({
+                    "Phase": ["Al2O3"]*31 + ["ZrO2"]*25,
+                    "Plane (hkl)": [
+                        "(012)", "(104)", "(110)", "(006)", "(113)", "(202)", "(024)", "(116)", "(211)", "(122)",
+                        "(018)", "(214)", "(300)", "(125)", "(208)", "(1010)", "(119)", "(217)", "(220)", "(306)",
+                        "(036)", "(223)", "(131)", "(312)", "(128)", "(0210)", "(0012)", "(134)", "(315)", "(226)", "(042)",
+                        "(101)", "(002)", "(110)", "(102)", "(112)", "(200)", "(201)", "(103)", "(211)", "(202)",
+                        "(212)", "(004)", "(220)", "(203)", "(104)", "(213)", "(301)", "(114)", "(222)", "(310)",
+                        "(311)", "(302)", "(204)", "(312)", "(214)"
+                    ],
+                    "2-Theta (Approx)": [
+                        25.58, 35.16, 37.78, 41.69, 43.36, 46.19, 52.56, 57.51, 59.75, 61.14,
+                        61.32, 66.53, 68.22, 70.43, 74.32, 76.89, 77.25, 80.44, 80.72, 83.23,
+                        83.23, 84.37, 85.16, 86.37, 86.52, 89.02, 90.73, 91.21, 94.84, 95.27, 98.42,
+                        30.08, 34.39, 35.11, 42.75, 49.96, 50.49, 53.67, 58.94, 59.90, 62.52,
+                        68.26, 72.48, 74.20, 75.94, 77.87, 81.26, 82.09, 83.16, 84.40, 84.81,
+                        87.32, 89.62, 93.60, 94.84, 98.85
+                    ],
+                    "Ref Intensity (I_0)": [
+                        61.1, 97.5, 45.3, 0.5, 98.9, 1.4, 50.5, 100.0, 2.6, 3.3,
+                        7.8, 40.1, 62.0, 1.3, 1.6, 17.9, 9.8, 0.8, 6.9, 0.4,
+                        0.4, 5.9, 0.3, 4.3, 3.1, 8.4, 2.1, 10.0, 0.2, 20.5, 2.8,
+                        100.0, 8.5, 13.2, 1.5, 36.3, 19.2, 0.0, 13.4, 25.4, 6.5,
+                        0.4, 2.0, 5.1, 0.0, 0.3, 9.9, 4.8, 3.9, 2.9, 2.5,
+                        0.0, 0.1, 4.2, 10.1, 0.3
+                    ]
+                })
+                st.session_state.ref_peaks_df["Show on Graph?"] = st.session_state.ref_peaks_df["Ref Intensity (I_0)"] >= 10.0
+                st.session_state.ref_peaks_df["Is Preferred Plane?"] = st.session_state.ref_peaks_df["Plane (hkl)"].isin(["(006)", "(0012)", "(002)", "(004)"])
+                
+            ref_peaks = st.data_editor(st.session_state.ref_peaks_df, num_rows="dynamic", use_container_width=True, key="ref_peaks_editor")
+            st.session_state.ref_peaks_df = ref_peaks 
+            
+            if not ref_peaks.empty:
+                ref_peaks["Phase_Plane"] = ref_peaks["Phase"] + " " + ref_peaks["Plane (hkl)"]
+                all_planes = ref_peaks["Phase_Plane"].tolist()
             else:
-                graph_height = 700
+                all_planes = []
 
-            if selected_xrd_files:
-                first_file_df = all_xrd_data[selected_xrd_files[0]]
-                col_options = list(first_file_df.columns)
-                x_col = "2-Theta" if "2-Theta" in col_options else col_options[0]
-                y_col = "Intensity" if "Intensity" in col_options else (col_options[1] if len(col_options) > 1 else col_options[0])
+        if sorted_xrd_files:
+            x_col = "2-Theta" if "2-Theta" in all_xrd_data[sorted_xrd_files[0]].columns else all_xrd_data[sorted_xrd_files[0]].columns[0]
+            y_col = "Intensity" if "Intensity" in all_xrd_data[sorted_xrd_files[0]].columns else all_xrd_data[sorted_xrd_files[0]].columns[1]
 
-                plot_data = pd.DataFrame()
-                for i, file_name in enumerate(selected_xrd_files):
-                    temp_df = all_xrd_data[file_name].copy()
-                    temp_df["Sample Name"] = custom_xrd_labels[file_name]
+            plot_data = pd.DataFrame()
+            for i, file_name in enumerate(sorted_xrd_files):
+                temp_df = all_xrd_data[file_name].copy()
+                temp_df["Sample Name"] = custom_xrd_labels[file_name]
+                
+                if x_col in temp_df.columns and y_col in temp_df.columns:
+                    temp_df = temp_df[[x_col, y_col, "Sample Name"]].dropna()
+                    temp_df[x_col] = pd.to_numeric(temp_df[x_col], errors='coerce')
+                    temp_df[y_col] = pd.to_numeric(temp_df[y_col], errors='coerce')
+                    temp_df = temp_df.dropna()
                     
-                    if x_col in temp_df.columns and y_col in temp_df.columns:
-                        temp_df = temp_df[[x_col, y_col, "Sample Name"]].dropna()
-                        temp_df[x_col] = pd.to_numeric(temp_df[x_col], errors='coerce')
-                        temp_df[y_col] = pd.to_numeric(temp_df[y_col], errors='coerce')
-                        temp_df = temp_df.dropna()
-                        
-                        min_y = temp_df[y_col].min()
-                        max_y = temp_df[y_col].max()
-                        if max_y > min_y:
-                            temp_df["Normalized Intensity"] = (temp_df[y_col] - min_y) / (max_y - min_y)
-                        else:
-                            temp_df["Normalized Intensity"] = 0
-                            
-                        if display_mode == "Stacked":
-                            temp_df["Plot Intensity"] = temp_df["Normalized Intensity"] + i
-                        else:
-                            temp_df["Plot Intensity"] = temp_df["Normalized Intensity"]
-                        plot_data = pd.concat([plot_data, temp_df])
+                    if strip_ka2:
+                        temp_df[y_col] = strip_ka2_rachinger(temp_df[x_col].values, temp_df[y_col].values)
+                    
+                    min_y, max_y = temp_df[y_col].min(), temp_df[y_col].max()
+                    temp_df["Normalized Intensity"] = (temp_df[y_col] - min_y) / (max_y - min_y) if max_y > min_y else 0
+                    temp_df["Plot Intensity"] = temp_df["Normalized Intensity"] + i if display_mode == "Stacked" else temp_df["Normalized Intensity"]
+                    plot_data = pd.concat([plot_data, temp_df])
 
-                if not plot_data.empty:
-                    st.write(f"### XRD Plot ({display_mode} View)")
-                    
-                    color_map = {custom_xrd_labels[f]: custom_xrd_colors[f] for f in selected_xrd_files}
-                    fig = px.line(plot_data, x=x_col, y="Plot Intensity", color="Sample Name", color_discrete_map=color_map)
-                    
-                    fig.update_layout(plot_bgcolor='white', hovermode="x unified", legend=dict(title=None, orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99))
-                    fig.update_xaxes(title_text="2θ (degrees)", showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
-                    
-                    if display_mode == "Stacked":
-                        fig.update_yaxes(title_text="Intensity (a.u.)", showticklabels=False, showgrid=False, ticks="", showline=True, linewidth=1, linecolor='black', mirror=True)
-                    else:
-                        fig.update_yaxes(title_text="Normalized Intensity (a.u.)", showticklabels=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
+            if not plot_data.empty:
+                st.caption("💡 **Tip:** You can click and drag the Floating Labels (and Miller Indices) directly on the graph!")
+                
+                plot_data[x_col] = pd.to_numeric(plot_data[x_col], errors='coerce')
 
-                    if use_custom_size:
-                        fig.update_layout(width=graph_width, height=graph_height)
-                    else:
-                        fig.update_layout(height=graph_height)
+                color_map = {custom_xrd_labels[f]: custom_xrd_colors[f] for f in sorted_xrd_files}
+                fig = px.line(plot_data, x=x_col, y="Plot Intensity", color="Sample Name", color_discrete_map=color_map)
+                fig.update_traces(opacity=line_opacity)
+                
+                # --- NEW: HIDE STANDARD LEGEND, ADD FLOATING LABELS ---
+                fig.update_layout(showlegend=False)
+                
+                for file_name in sorted_xrd_files:
+                    s_name = custom_xrd_labels[file_name]
+                    c_color = custom_xrd_colors[file_name]
+                    
+                    # Isolate data for this specific line
+                    s_data = plot_data[plot_data["Sample Name"] == s_name]
+                    if not s_data.empty:
+                        # Find the max 2-Theta point (the end of the line)
+                        max_x = s_data[x_col].max()
+                        end_y = s_data[s_data[x_col] == max_x]["Plot Intensity"].values[0]
+                        
+                        # Pin label directly to the end of the line
+                        fig.add_annotation(
+                            x=max_x,
+                            y=end_y,
+                            text=s_name,
+                            font=dict(color=c_color, size=14, family="Arial"),
+                            showarrow=False,
+                            xanchor="left",
+                            yanchor="middle",
+                            xshift=10 # Nudges it slightly right so it doesn't overlap the line
+                        )
+                
+                # ---------------------------------------------------------
+                # ANNOTATIONS: Miller Indices
+                # ---------------------------------------------------------
+                if show_annotations and not ref_peaks.empty:
+                    is_shown = ref_peaks["Show on Graph?"].fillna(False).astype(bool)
+                    for _, row in ref_peaks[is_shown].iterrows():
+                        target_x = float(row["2-Theta (Approx)"])
+                        window = plot_data[(plot_data[x_col] >= target_x - 0.3) & (plot_data[x_col] <= target_x + 0.3)]
+                        peak_y = window["Plot Intensity"].max() if not window.empty else plot_data["Plot Intensity"].max()
+                        
+                        fig.add_shape(type="line", x0=target_x, x1=target_x, y0=0, y1=peak_y, line=dict(color="rgba(128,128,128,0.5)", width=1, dash="dot"))
+                        
+                        fig.add_annotation(
+                            x=target_x, y=peak_y, text=f"{row['Phase']} {row['Plane (hkl)']}",
+                            showarrow=True, arrowhead=0, arrowwidth=1, arrowcolor="rgba(128,128,128,0.8)",
+                            ax=0, ay=-30, textangle=-90, xanchor="center", yanchor="bottom"
+                        )
+                
+                # Extended right margin so floating labels fit during image export
+                fig.update_layout(plot_bgcolor='white', hovermode="x unified", margin=dict(r=150))
+                fig.update_xaxes(title_text="2θ (degrees)", type="linear", showgrid=True, gridwidth=1, gridcolor='LightGray', ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
+                
+                if display_mode == "Stacked": fig.update_yaxes(title_text="Intensity (a.u.)", type="linear", showticklabels=False, showgrid=False, ticks="", showline=True, linewidth=1, linecolor='black', mirror=True)
+                else: fig.update_yaxes(title_text="Normalized Intensity (a.u.)", type="linear", showticklabels=True, showgrid=False, ticks="inside", showline=True, linewidth=1, linecolor='black', mirror=True)
 
-                    exp_w = graph_width if use_custom_size else 1200
-                    exp_h = graph_height if use_custom_size else 900
-                    export_config = {'toImageButtonOptions': {'format': 'png', 'filename': f'XRD_Plot_{display_mode}', 'height': exp_h, 'width': exp_w, 'scale': 3}}
+                if use_custom_size: fig.update_layout(width=graph_width, height=graph_height)
+                else: fig.update_layout(height=graph_height)
+
+                export_config = {
+                    'toImageButtonOptions': {'format': 'png', 'filename': f'XRD_Plot_{display_mode}', 'height': graph_height if use_custom_size else 900, 'width': graph_width if use_custom_size else 1200, 'scale': 3},
+                    'editable': True,
+                    'edits': {'legendPosition': True, 'annotationPosition': True, 'titleText': False, 'axisTitleText': False}
+                }
+                st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
+                
+                # ---------------------------------------------------------
+                # 🔬 LOTGERING FACTOR ANALYSIS
+                # ---------------------------------------------------------
+                with st.expander("🔬 Lotgering Factor Analysis (Orientation Calculation)", expanded=False):
+                    search_window = st.slider("Peak Search Window (± 2-Theta)", 0.1, 2.0, 0.3, 0.1)
+                    st.write("#### Per-Sample Peak Configuration")
                     
-                    st.plotly_chart(fig, use_container_width=not use_custom_size, config=export_config)
-                    
-                    # ---------------------------------------------------------
-                    # 🔬 INDEPENDENT PER-SAMPLE LOTGERING FACTOR
-                    # ---------------------------------------------------------
-                    with st.expander("🔬 Lotgering Factor Analysis (Orientation Calculation)", expanded=False):
-                        st.write("Calculates orientation ($f$) based on JCPDS Ref Cards 2300448 (Al₂O₃) and 1526427 (ZrO₂). Select your target planes per sample to avoid overlap.")
-                        
-                        col1, col2 = st.columns([1, 2])
-                        with col1:
-                            search_window = st.slider("Peak Search Window (± 2-Theta)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
-                        
-                        # Master Reference Table populated from the uploaded PDFs
-                        if 'ref_peaks_df' not in st.session_state:
-                            st.session_state.ref_peaks_df = pd.DataFrame({
-                                "Phase": ["Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "Al2O3", "ZrO2", "ZrO2", "ZrO2", "ZrO2"],
-                                "Plane (hkl)": ["(012)", "(104)", "(110)", "(006)", "(113)", "(024)", "(116)", "(101)", "(002)", "(110)", "(112)"],
-                                "2-Theta (Approx)": [25.58, 35.15, 37.78, 41.68, 43.36, 52.55, 57.50, 30.08, 34.60, 35.30, 50.20],
-                                "Ref Intensity (I_0)": [61.1, 100.0, 40.0, 5.0, 50.0, 30.0, 40.0, 100.0, 20.0, 20.0, 50.0],
-                                "Is Preferred Plane?": [False, False, False, True, False, False, False, False, False, False, False]
-                            })
-                            
-                        ref_peaks = st.data_editor(st.session_state.ref_peaks_df, num_rows="dynamic", use_container_width=True)
-                        
-                        ref_peaks["Phase_Plane"] = ref_peaks["Phase"] + " " + ref_peaks["Plane (hkl)"]
-                        all_planes = ref_peaks["Phase_Plane"].tolist()
-                        
-                        st.divider()
-                        st.write("#### Per-Sample Peak Configuration")
-                        st.write("To prevent mathematical errors, the app defaults to calculating Alumina only. If you wish to calculate Zirconia orientation, uncheck the Alumina planes and select the Zirconia planes.")
-                        
+                    if not ref_peaks.empty:
                         results = []
-
-                        for file_name in selected_xrd_files:
+                        for file_name in sorted_xrd_files:
                             sample_name = custom_xrd_labels[file_name]
                             
                             with st.expander(f"⚙️ Configure: {sample_name}", expanded=False):
                                 default_al2o3 = [p for p in all_planes if "Al2O3" in p]
-                                
-                                included_planes = st.multiselect(
-                                    f"Include these planes for {sample_name}:",
-                                    options=all_planes,
-                                    default=default_al2o3,
-                                    key=f"planes_{file_name}"
-                                )
-                                
+                                included_planes = st.multiselect(f"Include these planes for {sample_name}:", options=all_planes, default=default_al2o3, key=f"planes_{file_name}")
                                 sample_ref_peaks = ref_peaks[ref_peaks["Phase_Plane"].isin(included_planes)]
                                 
                                 if not sample_ref_peaks.empty:
@@ -399,26 +424,17 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                                     p0 = sum_i0_pref / sum_i0_all if sum_i0_all > 0 else 0
                                     
                                     df = all_xrd_data[file_name]
-                                    sum_i_all = 0
-                                    sum_i_pref = 0
+                                    sum_i_all, sum_i_pref = 0, 0
                                     extracted_intensities = {}
                                     
                                     for _, row in sample_ref_peaks.iterrows():
-                                        target_2theta = row["2-Theta (Approx)"]
-                                        is_pref = row["Is Preferred Plane?"]
-                                        plane_name = row["Phase_Plane"]
-                                        
+                                        target_2theta, is_pref, plane_name = row["2-Theta (Approx)"], row["Is Preferred Plane?"], row["Phase_Plane"]
                                         window = df[(df[x_col] >= target_2theta - search_window) & (df[x_col] <= target_2theta + search_window)]
-                                        if not window.empty:
-                                            peak_intensity = window[y_col].max() - window[y_col].min()
-                                        else:
-                                            peak_intensity = 0
+                                        peak_intensity = window[y_col].max() - window[y_col].min() if not window.empty else 0
                                             
                                         extracted_intensities[plane_name] = round(peak_intensity, 2)
-                                        
                                         sum_i_all += peak_intensity
-                                        if is_pref:
-                                            sum_i_pref += peak_intensity
+                                        if is_pref: sum_i_pref += peak_intensity
                                             
                                     p = sum_i_pref / sum_i_all if sum_i_all > 0 else 0
                                     f = (p - p0) / (1 - p0) if (1 - p0) != 0 else 0
@@ -440,12 +456,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                         if results:
                             st.write("#### Final Comparison Table")
                             st.dataframe(pd.DataFrame(results), use_container_width=True)
-
-                else:
-                    st.warning("No valid data to plot.")
-            else:
-                st.warning("Please select at least one file to plot.")
-        except Exception as e:
-            st.error(f"Error reading file structure. Details: {e}")
+                    else:
+                        st.info("Add reference peaks to the database above to calculate the Lotgering Factor.")
     else:
         st.info("Awaiting file upload. You can drag and drop multiple .csv or .txt files here.")
