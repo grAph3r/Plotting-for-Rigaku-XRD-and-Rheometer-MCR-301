@@ -98,7 +98,6 @@ def strip_ka2_rachinger(two_theta, intensity, lambda1=1.540598, lambda2=1.544426
     return I_stripped_sorted[unsort_idx]
 
 def parse_icdd_txt(file_bytes, filename):
-    """Parses COD/ICDD .txt format files to extract Reference Database Peaks"""
     text = decode_file(file_bytes)
     lines = text.splitlines()
     
@@ -107,29 +106,47 @@ def parse_icdd_txt(file_bytes, filename):
         if line.startswith("Name:"):
             phase_name = line.split("Name:")[1].strip()
             break
+        elif line.startswith("- Name:"):
+            phase_name = line.split("- Name:")[1].strip()
+            break
         elif line.startswith("Chemical Formula:"):
             phase_name = line.split("Chemical Formula:")[1].strip()
             break
             
-    data_start_idx = -1
-    for i, line in enumerate(lines):
-        if "2theta" in line.lower() and "d" in line.lower() and "i" in line.lower():
-            data_start_idx = i + 1
-            break
-            
     new_peaks = []
-    if data_start_idx != -1:
-        for line in lines[data_start_idx:]:
-            parts = line.split()
-            if len(parts) >= 4:
-                try:
-                    two_theta = float(parts[0])
-                    intensity = float(parts[2])
-                    hkl = parts[3].replace(",", "")
-                    
-                    is_pref = False
-                    if hkl.startswith("(00") or hkl.startswith("(00-"):
-                        is_pref = True
+    is_data_section = False
+    
+    for line in lines:
+        line = line.strip()
+        lower_line = line.lower()
+        
+        # Detect headers for both COD and Rigaku PDXL2 TXT formats
+        if not is_data_section and (("2-theta" in lower_line or "2theta" in lower_line) and ("intensity" in lower_line or " i " in lower_line or "(hkl)" in lower_line or "h |" in lower_line)):
+            is_data_section = True
+            continue
+        
+        if is_data_section:
+            if line.startswith("---") or line == "":
+                continue
+                
+            clean_line = line.replace("|", " ").replace(",", " ")
+            parts = clean_line.split()
+            
+            try:
+                if len(parts) >= 4:
+                    # Rigaku PDXL2 format
+                    if len(parts) >= 7 and parts[0].isdigit() and "." not in parts[0]:
+                        two_theta = float(parts[1])
+                        intensity = float(parts[3])
+                        hkl = f"({parts[4]}{parts[5]}{parts[6]})"
+                    # Standard COD format
+                    else:
+                        two_theta = float(parts[0])
+                        intensity = float(parts[2])
+                        hkl_raw = "".join(parts[3:]).replace("(", "").replace(")", "")
+                        hkl = f"({hkl_raw})"
+                        
+                    is_pref = hkl.startswith("(00") or hkl.startswith("(00-")
                         
                     new_peaks.append({
                         "Phase": phase_name,
@@ -139,8 +156,9 @@ def parse_icdd_txt(file_bytes, filename):
                         "Show on Graph?": intensity >= 10.0,
                         "Is Preferred Plane?": is_pref
                     })
-                except ValueError:
-                    continue
+            except ValueError:
+                continue
+                
     return pd.DataFrame(new_peaks)
 
 
@@ -337,11 +355,10 @@ elif app_mode == "X-Ray Diffraction (XRD)":
         graph_height = st.sidebar.slider("Height (px)", 400, 1600, 800, 50, key="xrd_h") if use_custom_size else 700
 
         # ---------------------------------------------------------
-        # 📚 ICDD REFERENCE DATABASE & ANNOTATIONS (NEW SECTION)
+        # 📚 ICDD REFERENCE DATABASE & ANNOTATIONS
         # ---------------------------------------------------------
         with st.expander("📚 ICDD Reference Database & Annotations", expanded=True):
             
-            # Start with a completely empty, clean slate DataFrame
             if 'ref_peaks_df' not in st.session_state:
                 st.session_state.ref_peaks_df = pd.DataFrame(columns=[
                     "Phase", "Plane (hkl)", "2-Theta (Approx)", "Ref Intensity (I_0)", "Show on Graph?", "Is Preferred Plane?"
@@ -392,7 +409,6 @@ elif app_mode == "X-Ray Diffraction (XRD)":
 
             plot_data = pd.DataFrame()
             
-            # Base offset so raw data graphs sit above the ICDD reference if stacked
             offset_base = 1 if (show_icdd_bottom and display_mode == "Stacked" and not ref_peaks.empty) else 0
             
             for i, file_name in enumerate(sorted_xrd_files):
@@ -424,7 +440,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                 fig = px.line(plot_data, x=x_col, y="Plot Intensity", color="Sample Name", color_discrete_map=color_map)
                 fig.update_traces(opacity=line_opacity)
                 
-                # --- PLOT ICDD STEM GRAPH AT THE BOTTOM ---
+                # --- PLOT ICDD STEM GRAPH ---
                 if show_icdd_bottom and not ref_peaks.empty and phases_to_plot:
                     is_shown = ref_peaks["Show on Graph?"].fillna(False).astype(bool)
                     
@@ -464,7 +480,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
 
                 fig.update_layout(showlegend=False)
                 
-                # Plot Raw Data Floating Labels
+                # --- RAW DATA FLOATING LABELS ---
                 for file_name in sorted_xrd_files:
                     s_name = custom_xrd_labels[file_name]
                     c_color = custom_xrd_colors[file_name]
@@ -532,8 +548,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             sample_name = custom_xrd_labels[file_name]
                             
                             with st.expander(f"⚙️ Configure: {sample_name}", expanded=False):
-                                # Default to the first available phase to prevent errors
-                                default_phase = [p for p in all_planes if available_phases and available_phases[0] in p]
+                                default_phase = [p for p in all_planes if available_phases and available_phases[0] in p] if available_phases else []
                                 included_planes = st.multiselect(f"Include these planes for {sample_name}:", options=all_planes, default=default_phase, key=f"planes_{file_name}")
                                 sample_ref_peaks = ref_peaks[ref_peaks["Phase_Plane"].isin(included_planes)]
                                 
@@ -564,6 +579,7 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                                     
                                     results.append({
                                         "Sample Name": sample_name,
+                                        "Primary Phase Analysed": "Mixed" if len(set([p.split(' ')[0] for p in included_planes])) > 1 else (included_planes[0].split(' ')[0] if included_planes else "None"),
                                         "P₀ (Ref)": round(p0, 4),
                                         "P (Sample)": round(p, 4),
                                         "Lotgering Factor (f)": round(f, 4)
