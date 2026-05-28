@@ -29,11 +29,9 @@ def parse_rheometer_txt(file_content):
     
     for line in lines:
         line = line.strip()
-        # Detect the start of a new data block and read headers dynamically
         if line.startswith("Meas. Pts"):
             if data_lines and headers:  
                 df = pd.DataFrame(data_lines, columns=headers)
-                # Strip out entirely non-numeric columns (like 'Status') and drop broken rows
                 df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(how='any')
                 if not df.empty:
                     intervals[f"Interval {current_interval}"] = df
@@ -58,7 +56,6 @@ def parse_rheometer_txt(file_content):
             if len(values) >= len(headers) and len(headers) > 0:
                 data_lines.append(values[:len(headers)])
 
-    # Catch the final interval
     if data_lines and headers:
         df = pd.DataFrame(data_lines, columns=headers)
         df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(how='any')
@@ -99,6 +96,52 @@ def strip_ka2_rachinger(two_theta, intensity, lambda1=1.540598, lambda2=1.544426
     I_stripped_sorted = np.clip(I_stripped_sorted, 0, None)
     unsort_idx = np.argsort(sort_idx)
     return I_stripped_sorted[unsort_idx]
+
+def parse_icdd_txt(file_bytes, filename):
+    """Parses COD/ICDD .txt format files to extract Reference Database Peaks"""
+    text = decode_file(file_bytes)
+    lines = text.splitlines()
+    
+    phase_name = filename.split('.')[0]
+    for line in lines[:20]:
+        if line.startswith("Name:"):
+            phase_name = line.split("Name:")[1].strip()
+            break
+        elif line.startswith("Chemical Formula:"):
+            phase_name = line.split("Chemical Formula:")[1].strip()
+            break
+            
+    data_start_idx = -1
+    for i, line in enumerate(lines):
+        if "2theta" in line.lower() and "d" in line.lower() and "i" in line.lower():
+            data_start_idx = i + 1
+            break
+            
+    new_peaks = []
+    if data_start_idx != -1:
+        for line in lines[data_start_idx:]:
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    two_theta = float(parts[0])
+                    intensity = float(parts[2])
+                    hkl = parts[3].replace(",", "")
+                    
+                    is_pref = False
+                    if hkl.startswith("(00") or hkl.startswith("(00-"):
+                        is_pref = True
+                        
+                    new_peaks.append({
+                        "Phase": phase_name,
+                        "Plane (hkl)": hkl, 
+                        "2-Theta (Approx)": two_theta,
+                        "Ref Intensity (I_0)": intensity,
+                        "Show on Graph?": intensity >= 10.0,
+                        "Is Preferred Plane?": is_pref
+                    })
+                except ValueError:
+                    continue
+    return pd.DataFrame(new_peaks)
 
 
 # =========================================================
@@ -143,7 +186,6 @@ if app_mode == "Rheology (Anton Paar)":
         for unique_inv in sorted_intervals:
             temp_df = all_parsed_intervals[unique_inv].copy()
             
-            # Robustly compute base viscosity
             if "Shear Stress" in temp_df.columns and "Shear Rate" in temp_df.columns:
                 base_viscosity = temp_df["Shear Stress"] / temp_df["Shear Rate"]
             elif "Viscosity" in temp_df.columns:
@@ -173,7 +215,6 @@ if app_mode == "Rheology (Anton Paar)":
             x_exp_format, x_dtick = ("power", 1) if x_type == "log" else ("none", None)
             y_exp_format, y_dtick = ("power", 1) if y_type == "log" else ("none", None)
 
-            # Safely determine the primary X-axis column for filtering
             x_axis_col = "Shear Rate" if "Shear Rate" in plot_df.columns else plot_df.columns[0]
             st.sidebar.header(f"6. Filter Data Range ({x_axis_col})")
             
@@ -247,7 +288,7 @@ if app_mode == "Rheology (Anton Paar)":
 elif app_mode == "X-Ray Diffraction (XRD)":
     st.header("X-Ray Diffraction (XRD) Analysis")
     st.sidebar.header("1. Upload Data")
-    xrd_files = st.sidebar.file_uploader("Upload XRD Data (.csv or .txt)", type=["csv", "txt"], accept_multiple_files=True)
+    xrd_files = st.sidebar.file_uploader("Upload RAW XRD Data (.csv or .txt)", type=["csv", "txt"], accept_multiple_files=True)
     
     if xrd_files:
         st.sidebar.header("2. File Settings")
@@ -257,12 +298,20 @@ elif app_mode == "X-Ray Diffraction (XRD)":
         all_xrd_data = {}
         for file in xrd_files:
             decoded_str = decode_file(file.getvalue())
-            df = pd.read_csv(io.StringIO(decoded_str), skiprows=skip_rows, header=0 if has_headers else None, sep=None, engine='python')
-            if not has_headers:
-                cols = list(df.columns)
-                if len(cols) >= 2: df.rename(columns={cols[0]: "2-Theta", cols[1]: "Intensity"}, inplace=True)
-                else: df.rename(columns={cols[0]: "2-Theta"}, inplace=True)
-            all_xrd_data[file.name] = df
+            
+            try:
+                df = pd.read_csv(io.StringIO(decoded_str), skiprows=skip_rows, header=0 if has_headers else None, sep=None, engine='python')
+                if not has_headers:
+                    cols = list(df.columns)
+                    if len(cols) >= 2: df.rename(columns={cols[0]: "2-Theta", cols[1]: "Intensity"}, inplace=True)
+                    else: df.rename(columns={cols[0]: "2-Theta"}, inplace=True)
+                all_xrd_data[file.name] = df
+            except pd.errors.ParserError:
+                st.error(f"❌ Could not read `{file.name}`. This file looks like an ICDD reference file, not a raw XRD measurement.")
+                continue 
+        
+        if not all_xrd_data:
+            st.stop()
         
         st.sidebar.header("3. Data Selection")
         selected_xrd_files = st.sidebar.multiselect("Select Files to Plot", list(all_xrd_data.keys()), default=list(all_xrd_data.keys()))
@@ -281,7 +330,6 @@ elif app_mode == "X-Ray Diffraction (XRD)":
         display_mode = st.sidebar.radio("Display Mode", ["Overlay", "Stacked"])
         strip_ka2 = st.sidebar.checkbox("Strip Cu Kα₂ Peaks (Rachinger Method)", value=False)
         line_opacity = st.sidebar.slider("Line Opacity", 0.1, 1.0, 1.0, 0.1)
-        show_annotations = st.sidebar.checkbox("Show Miller Indices Annotations", value=False)
 
         st.sidebar.header("6. Graph Dimensions")
         use_custom_size = st.sidebar.checkbox("Custom Graph Size", value=False, key="xrd_size_toggle")
@@ -289,54 +337,64 @@ elif app_mode == "X-Ray Diffraction (XRD)":
         graph_height = st.sidebar.slider("Height (px)", 400, 1600, 800, 50, key="xrd_h") if use_custom_size else 700
 
         # ---------------------------------------------------------
-        # 📚 CENTRAL REFERENCE DATABASE
+        # 📚 ICDD REFERENCE DATABASE & ANNOTATIONS (NEW SECTION)
         # ---------------------------------------------------------
-        with st.expander("📚 Reference Peaks Database (Al2O3 / ZrO2)", expanded=False):
+        with st.expander("📚 ICDD Reference Database & Annotations", expanded=True):
+            
+            # Start with a completely empty, clean slate DataFrame
             if 'ref_peaks_df' not in st.session_state:
-                st.session_state.ref_peaks_df = pd.DataFrame({
-                    "Phase": ["Al2O3"]*31 + ["ZrO2"]*25,
-                    "Plane (hkl)": [
-                        "(012)", "(104)", "(110)", "(006)", "(113)", "(202)", "(024)", "(116)", "(211)", "(122)",
-                        "(018)", "(214)", "(300)", "(125)", "(208)", "(1010)", "(119)", "(217)", "(220)", "(306)",
-                        "(036)", "(223)", "(131)", "(312)", "(128)", "(0210)", "(0012)", "(134)", "(315)", "(226)", "(042)",
-                        "(101)", "(002)", "(110)", "(102)", "(112)", "(200)", "(201)", "(103)", "(211)", "(202)",
-                        "(212)", "(004)", "(220)", "(203)", "(104)", "(213)", "(301)", "(114)", "(222)", "(310)",
-                        "(311)", "(302)", "(204)", "(312)", "(214)"
-                    ],
-                    "2-Theta (Approx)": [
-                        25.58, 35.16, 37.78, 41.69, 43.36, 46.19, 52.56, 57.51, 59.75, 61.14,
-                        61.32, 66.53, 68.22, 70.43, 74.32, 76.89, 77.25, 80.44, 80.72, 83.23,
-                        83.23, 84.37, 85.16, 86.37, 86.52, 89.02, 90.73, 91.21, 94.84, 95.27, 98.42,
-                        30.08, 34.39, 35.11, 42.75, 49.96, 50.49, 53.67, 58.94, 59.90, 62.52,
-                        68.26, 72.48, 74.20, 75.94, 77.87, 81.26, 82.09, 83.16, 84.40, 84.81,
-                        87.32, 89.62, 93.60, 94.84, 98.85
-                    ],
-                    "Ref Intensity (I_0)": [
-                        61.1, 97.5, 45.3, 0.5, 98.9, 1.4, 50.5, 100.0, 2.6, 3.3,
-                        7.8, 40.1, 62.0, 1.3, 1.6, 17.9, 9.8, 0.8, 6.9, 0.4,
-                        0.4, 5.9, 0.3, 4.3, 3.1, 8.4, 2.1, 10.0, 0.2, 20.5, 2.8,
-                        100.0, 8.5, 13.2, 1.5, 36.3, 19.2, 0.0, 13.4, 25.4, 6.5,
-                        0.4, 2.0, 5.1, 0.0, 0.3, 9.9, 4.8, 3.9, 2.9, 2.5,
-                        0.0, 0.1, 4.2, 10.1, 0.3
-                    ]
-                })
-                st.session_state.ref_peaks_df["Show on Graph?"] = st.session_state.ref_peaks_df["Ref Intensity (I_0)"] >= 10.0
-                st.session_state.ref_peaks_df["Is Preferred Plane?"] = st.session_state.ref_peaks_df["Plane (hkl)"].isin(["(006)", "(0012)", "(002)", "(004)"])
+                st.session_state.ref_peaks_df = pd.DataFrame(columns=[
+                    "Phase", "Plane (hkl)", "2-Theta (Approx)", "Ref Intensity (I_0)", "Show on Graph?", "Is Preferred Plane?"
+                ])
                 
+            uploaded_icdd = st.file_uploader("Upload ICDD Data (.txt)", type=["txt"], accept_multiple_files=True, key="icdd_uploader", help="Upload COD/ICDD text files to extract theoretical peaks.")
+            
+            if st.button("Extract Peaks from .txt", type="primary") and uploaded_icdd:
+                new_data_frames = []
+                for txt_file in uploaded_icdd:
+                    extracted_df = parse_icdd_txt(txt_file.getvalue(), txt_file.name)
+                    if not extracted_df.empty:
+                        new_data_frames.append(extracted_df)
+                
+                if new_data_frames:
+                    combined_new = pd.concat(new_data_frames, ignore_index=True)
+                    st.session_state.ref_peaks_df = pd.concat([st.session_state.ref_peaks_df, combined_new], ignore_index=True).drop_duplicates(subset=["Phase", "Plane (hkl)", "2-Theta (Approx)"])
+                    st.success("Successfully imported peaks!")
+                    st.rerun()
+
+            st.write("##### Manage Reference Peaks")
             ref_peaks = st.data_editor(st.session_state.ref_peaks_df, num_rows="dynamic", use_container_width=True, key="ref_peaks_editor")
             st.session_state.ref_peaks_df = ref_peaks 
             
             if not ref_peaks.empty:
                 ref_peaks["Phase_Plane"] = ref_peaks["Phase"] + " " + ref_peaks["Plane (hkl)"]
                 all_planes = ref_peaks["Phase_Plane"].tolist()
+                available_phases = ref_peaks["Phase"].unique().tolist()
             else:
                 all_planes = []
+                available_phases = []
+
+            st.divider()
+            st.write("##### Graph Annotation Controls")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                show_icdd_bottom = st.checkbox("Plot ICDD Reference at Bottom", value=True, help="Draws theoretical vertical stems for selected phases.")
+                phases_to_plot = st.multiselect("Select Phases to Plot (Stem Graph):", available_phases, default=available_phases)
+            with col2:
+                show_annotations = st.checkbox("Show Miller Indices Annotations on Peaks", value=False, help="Pins (hkl) text on top of your raw data peaks.")
+                phases_to_annotate = st.multiselect("Select Phases to Annotate:", available_phases, default=available_phases)
+
 
         if sorted_xrd_files:
             x_col = "2-Theta" if "2-Theta" in all_xrd_data[sorted_xrd_files[0]].columns else all_xrd_data[sorted_xrd_files[0]].columns[0]
             y_col = "Intensity" if "Intensity" in all_xrd_data[sorted_xrd_files[0]].columns else all_xrd_data[sorted_xrd_files[0]].columns[1]
 
             plot_data = pd.DataFrame()
+            
+            # Base offset so raw data graphs sit above the ICDD reference if stacked
+            offset_base = 1 if (show_icdd_bottom and display_mode == "Stacked" and not ref_peaks.empty) else 0
+            
             for i, file_name in enumerate(sorted_xrd_files):
                 temp_df = all_xrd_data[file_name].copy()
                 temp_df["Sample Name"] = custom_xrd_labels[file_name]
@@ -353,7 +411,8 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                     min_y, max_y = temp_df[y_col].min(), temp_df[y_col].max()
                     temp_df["Normalized Intensity"] = (temp_df[y_col] - min_y) / (max_y - min_y) if max_y > min_y else 0
                     
-                    temp_df["Plot Intensity"] = temp_df["Normalized Intensity"] + i if display_mode == "Stacked" else temp_df["Normalized Intensity"]
+                    stack_offset = offset_base + i if display_mode == "Stacked" else 0
+                    temp_df["Plot Intensity"] = temp_df["Normalized Intensity"] + stack_offset
                     plot_data = pd.concat([plot_data, temp_df])
 
             if not plot_data.empty:
@@ -365,8 +424,47 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                 fig = px.line(plot_data, x=x_col, y="Plot Intensity", color="Sample Name", color_discrete_map=color_map)
                 fig.update_traces(opacity=line_opacity)
                 
+                # --- PLOT ICDD STEM GRAPH AT THE BOTTOM ---
+                if show_icdd_bottom and not ref_peaks.empty and phases_to_plot:
+                    is_shown = ref_peaks["Show on Graph?"].fillna(False).astype(bool)
+                    
+                    for idx, phase in enumerate(phases_to_plot):
+                        is_selected_phase = ref_peaks["Phase"] == phase
+                        ref_to_plot = ref_peaks[is_shown & is_selected_phase]
+                        
+                        if not ref_to_plot.empty:
+                            x_ref = []
+                            y_ref = []
+                            for _, row in ref_to_plot.iterrows():
+                                x_ref.extend([row["2-Theta (Approx)"], row["2-Theta (Approx)"], None])
+                                y_val = row["Ref Intensity (I_0)"] / 100.0
+                                y_ref.extend([0, y_val, None])
+                                
+                            phase_color = DEFAULT_COLORS[idx % len(DEFAULT_COLORS)]
+                            
+                            fig.add_trace(go.Scatter(
+                                x=x_ref, y=y_ref,
+                                mode="lines",
+                                line=dict(color=phase_color, width=2),
+                                name=f"{phase} Ref",
+                                hoverinfo="skip"
+                            ))
+                            
+                            max_x_overall = plot_data[x_col].max()
+                            fig.add_annotation(
+                                x=max_x_overall,
+                                y=0.5 - (idx * 0.15), 
+                                text=f"{phase} ICDD",
+                                font=dict(color=phase_color, size=14, family="Arial", weight="bold"),
+                                showarrow=False,
+                                xanchor="left",
+                                yanchor="middle",
+                                xshift=10
+                            )
+
                 fig.update_layout(showlegend=False)
                 
+                # Plot Raw Data Floating Labels
                 for file_name in sorted_xrd_files:
                     s_name = custom_xrd_labels[file_name]
                     c_color = custom_xrd_colors[file_name]
@@ -387,9 +485,12 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             xshift=10
                         )
                 
-                if show_annotations and not ref_peaks.empty:
+                # --- ANNOTATIONS: Miller Indices ---
+                if show_annotations and not ref_peaks.empty and phases_to_annotate:
                     is_shown = ref_peaks["Show on Graph?"].fillna(False).astype(bool)
-                    for _, row in ref_peaks[is_shown].iterrows():
+                    is_annotated_phase = ref_peaks["Phase"].isin(phases_to_annotate)
+                    
+                    for _, row in ref_peaks[is_shown & is_annotated_phase].iterrows():
                         target_x = float(row["2-Theta (Approx)"])
                         window = plot_data[(plot_data[x_col] >= target_x - 0.3) & (plot_data[x_col] <= target_x + 0.3)]
                         peak_y = window["Plot Intensity"].max() if not window.empty else plot_data["Plot Intensity"].max()
@@ -431,8 +532,9 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                             sample_name = custom_xrd_labels[file_name]
                             
                             with st.expander(f"⚙️ Configure: {sample_name}", expanded=False):
-                                default_al2o3 = [p for p in all_planes if "Al2O3" in p]
-                                included_planes = st.multiselect(f"Include these planes for {sample_name}:", options=all_planes, default=default_al2o3, key=f"planes_{file_name}")
+                                # Default to the first available phase to prevent errors
+                                default_phase = [p for p in all_planes if available_phases and available_phases[0] in p]
+                                included_planes = st.multiselect(f"Include these planes for {sample_name}:", options=all_planes, default=default_phase, key=f"planes_{file_name}")
                                 sample_ref_peaks = ref_peaks[ref_peaks["Phase_Plane"].isin(included_planes)]
                                 
                                 if not sample_ref_peaks.empty:
@@ -462,7 +564,6 @@ elif app_mode == "X-Ray Diffraction (XRD)":
                                     
                                     results.append({
                                         "Sample Name": sample_name,
-                                        "Primary Phase Analysed": "Mixed" if ("Al2O3" in str(included_planes) and "ZrO2" in str(included_planes)) else ("Al2O3" if "Al2O3" in str(included_planes) else "ZrO2"),
                                         "P₀ (Ref)": round(p0, 4),
                                         "P (Sample)": round(p, 4),
                                         "Lotgering Factor (f)": round(f, 4)
